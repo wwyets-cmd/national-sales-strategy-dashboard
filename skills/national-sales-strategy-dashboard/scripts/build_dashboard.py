@@ -18,7 +18,7 @@ build_dashboard.py — 炬森五金「销售数据看板」生成器（全国通
         [--keep-min-wan 5]                # 客户排名阈值(万)
         [--filter-min-wan 50]             # 筛选器客户阈值(万)
         [--title '炬森五金 · 销售数据看板']   # 看板标题
-        [--target 31900000]               # 年度总目标(元), 缺省=所有城市目标之和
+        [--target 50000000]              # 可选: 年度总目标(元), 通常建议写入 --targets 配置
         [--skip-25]                       # 跳过上年数据(不生成同比)
 
 数据口径:
@@ -44,13 +44,14 @@ import pandas as pd
 REMOVE_CUSTOMERS = set()          # 剔除客户(由 --exclude-customers 传入)
 MERGE_CUSTOMERS = {}              # 客户合并(由 --merge-customers 传入)
 CITY_TARGET_WAN = {}              # 地级市年度目标(万), 由 --targets 加载
+SALESMAN_TARGET_WAN = {}          # 业务员年度目标(万), 可由 --targets 的 salesman_target_wan 配置
+CONFIG_TOTAL_TARGET_WAN = None    # 配置文件中的总目标(万)
 PROVINCE_OWNER = {}               # 省份→业务员覆盖映射, 由 --province-owner 传入
 SALESMAN_COL = '销售员'           # 业务员字段列名
 KEEP_MIN_WAN = 5.0                # 客户排名: 当年销售额低于该值(万)的客户删除
 FILTER_MIN_WAN = 50.0             # 筛选器: 仅当年销售额≥该值(万)的客户进入
 TITLE = '全国销售数据看板'
-TOTAL_TARGET = 3190 * 10000
-DEFAULT_SALESMAN_TARGET_WAN = {'卢力': 2300.0, '刘滔': 1000.0}
+TOTAL_TARGET = 0                  # 年度总目标(元), 0=由目标配置提供；未配置则显示待配置
 
 CATEGORY_ORDER = ['基础五金-铰链', '基础五金-滑轨', '基础五金-反弹器', '拉篮', '水槽',
                   '水龙头', '柜体照明', '开门器', '升降机', '衣帽间五金', '滑轮',
@@ -344,14 +345,18 @@ def build_raw(df26, df25, max_month_override=None, data_cutoff_override=None):
     salesmen = []
     for sp in sp_sales26.sort_values(ascending=False).index:
         sp_name = str(sp)
-        tgt_wan = DEFAULT_SALESMAN_TARGET_WAN.get(sp_name, sum(city_prov_wan.get(c, ('', 0.0))[1] for c in sp_cities.get(sp, set()) if c in city_prov_wan))
+        city_target_sum = sum(city_prov_wan.get(c, ('', 0.0))[1] for c in sp_cities.get(sp, set()) if c in city_prov_wan)
+        tgt_wan = SALESMAN_TARGET_WAN.get(sp_name, city_target_sum)
         salesmen.append({
             'name': sp_name,
             'provinces': sp_provinces.get(sp, []),
             'cities': sorted(sp_cities.get(sp, set())),
             'target': int(tgt_wan * 10000), 'target_wan': round(tgt_wan, 1), 'target_configured': bool(tgt_wan),
         })
-    total_target = TOTAL_TARGET or int(sum(city_prov_wan[c][1] for c in city_prov_wan) * 10000)
+    configured_total_wan = TOTAL_TARGET / 10000 if TOTAL_TARGET else (
+        CONFIG_TOTAL_TARGET_WAN if CONFIG_TOTAL_TARGET_WAN is not None else sum(city_prov_wan[c][1] for c in city_prov_wan)
+    )
+    total_target = int(configured_total_wan * 10000)
 
     # ---- 客户明细 ----
     cust_city = cur.drop_duplicates('__cust').set_index('__cust')['__city'].to_dict()
@@ -492,7 +497,7 @@ def build_raw(df26, df25, max_month_override=None, data_cutoff_override=None):
         'title': TITLE,
         'target': int(total_target),
         'total_target': int(total_target),
-        'target_defaults': {'total_wan': 3190.0, 'salesman_wan': DEFAULT_SALESMAN_TARGET_WAN, 'missing_label': '待配置'},
+        'target_defaults': {'missing_label': '待配置'},
         'salesmen': salesmen,
         'max_month': int(max_month),
         'data_cutoff': cutoff,
@@ -569,8 +574,8 @@ def main():
     ap.add_argument('--file25', help='上年(2025)销售明细, 表头在第1行, 含全年数据')
     ap.add_argument('--skip-25', action='store_true', help='跳过上年数据(不生成同比)')
     ap.add_argument('--out', default='sales_dashboard.html')
-    ap.add_argument('--target', type=int, default=3190 * 10000, help='年度总目标(元), 缺省=所有城市目标之和')
-    ap.add_argument('--targets', default=None, help='地级市目标JSON文件(万)')
+    ap.add_argument('--target', type=int, default=0, help='可选：年度总目标(元)；默认读取 --targets 配置')
+    ap.add_argument('--targets', default=None, help='目标JSON文件(万)，支持城市简表或 total_wan/salesman_target_wan/cities 结构')
     ap.add_argument('--model-overrides', default=None, help='型号归一例外映射JSON: {"原始物料描述":"标准型号"}')
     ap.add_argument('--salesman-col', default='销售员', help='业务员字段列名(缺省:销售员)')
     ap.add_argument('--province-owner', default=None, help='省份→业务员覆盖JSON, 如 {"山东省":"卢力","浙江省":"刘滔"}')
@@ -582,11 +587,20 @@ def main():
     ap.add_argument('--template', default=None, help='HTML模板路径(默认脚本同目录template.html)')
     args = ap.parse_args()
 
-    global REMOVE_CUSTOMERS, MERGE_CUSTOMERS, CITY_TARGET_WAN, PROVINCE_OWNER, SALESMAN_COL
+    global REMOVE_CUSTOMERS, MERGE_CUSTOMERS, CITY_TARGET_WAN, SALESMAN_TARGET_WAN
+    global CONFIG_TOTAL_TARGET_WAN, PROVINCE_OWNER, SALESMAN_COL
     global KEEP_MIN_WAN, FILTER_MIN_WAN, TITLE, TOTAL_TARGET
     REMOVE_CUSTOMERS = set(load_json_file(args.exclude_customers, [], '剔除客户') or [])
     MERGE_CUSTOMERS = load_json_file(args.merge_customers, {}, '客户合并') or {}
-    CITY_TARGET_WAN = load_json_file(args.targets, {}, '目标配置') or {}
+    target_config = load_json_file(args.targets, {}, '目标配置') or {}
+    if isinstance(target_config, dict) and any(k in target_config for k in ('total_wan', 'salesman_target_wan', 'cities')):
+        CONFIG_TOTAL_TARGET_WAN = target_config.get('total_wan')
+        SALESMAN_TARGET_WAN = target_config.get('salesman_target_wan', {}) or {}
+        CITY_TARGET_WAN = target_config.get('cities', {}) or {}
+    else:
+        CONFIG_TOTAL_TARGET_WAN = None
+        SALESMAN_TARGET_WAN = {}
+        CITY_TARGET_WAN = target_config
     MODEL_OVERRIDES.update(load_json_file(args.model_overrides, {}, '型号映射') or {})
     PROVINCE_OWNER = load_json_file(args.province_owner, {}, '省份业务员映射') or {}
     SALESMAN_COL = args.salesman_col
